@@ -6,7 +6,9 @@ import { serveFrontend } from './handlers/frontend.js';
 import { handleUpdate, handleWebSocketUpgrade, handleUpdateWebSocketUpgrade } from './handlers/update.js';
 import { handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
 import { handleTheme } from './handlers/theme.js';
+import { handleGithubOAuthCallback, handleGithubOAuthStartApi, isGithubOAuthReady } from './handlers/githubAuth.js';
 import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOptions, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, saveThemeOptions, setDebug, debug } from './utils/settings.js';
+import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
@@ -133,7 +135,10 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
 
   const cached = getMetricsHistoryCache(id, clampedHours, columns, longHistoryPoints);
   if (cached && Date.now() - cached.timestamp < cacheDuration) {
-    return createSuccessResponse(cached.data, { 'X-Cache': 'HIT' });
+    const cachedData = Array.isArray(cached.data)
+      ? cached.data.map(omitNullLossProbeFields)
+      : cached.data;
+    return createSuccessResponse(cachedData, { 'X-Cache': 'HIT' });
   }
   
   let data;
@@ -148,6 +153,15 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
     );
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
+    if (/invalid history partition id/i.test(message)) {
+      debug('[History] 服务器未分配历史分区，无法按主键范围查询:', message);
+      return new Response(JSON.stringify({
+        message: 'historyPartitionNotAssigned'
+      }), {
+        status: 409,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
     if (/no such column/i.test(message)) {
       debug('[History] 数据库字段缺失，可能尚未升级数据库:', message);
       return new Response(JSON.stringify({
@@ -160,9 +174,12 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
     throw e;
   }
   
-  setMetricsHistoryCache(id, clampedHours, columns, data, longHistoryPoints);
+  const sanitizedData = Array.isArray(data)
+    ? data.map(omitNullLossProbeFields)
+    : data;
+  setMetricsHistoryCache(id, clampedHours, columns, sanitizedData, longHistoryPoints);
   
-  return createSuccessResponse(data, { 'X-Cache': 'MISS' });
+  return createSuccessResponse(sanitizedData, { 'X-Cache': 'MISS' });
 }
 
 export default {
@@ -307,6 +324,15 @@ export default {
           turnstile_enabled: turnstileEnabled,
           turnstile_login_enabled: turnstileEnabled || turnstileLoginEnabled,
           turnstile_site_key: sys.turnstile_site_key || '',
+          github_oauth_enabled: isGithubOAuthReady(sys),
+          custom_ct_name: sys.custom_ct_name || '电信',
+          custom_cu_name: sys.custom_cu_name || '联通',
+          custom_cm_name: sys.custom_cm_name || '移动',
+          custom_bd_name: sys.custom_bd_name || 'BGP',
+          node_1_name: sys.node_1_name || 'Node 1',
+          node_2_name: sys.node_2_name || 'Node 2',
+          node_3_name: sys.node_3_name || 'Node 3',
+          node_4_name: sys.node_4_name || 'Node 4',
           site_title: appearanceOptions.site_title || '',
           display_mode: appearanceOptions.display_mode || 'bar',
           preferred_theme: appearanceOptions.preferred_theme || 'auto',
@@ -321,6 +347,30 @@ export default {
             hours: DASHBOARD_LATENCY_WINDOW_HOURS
           }
         });
+      }},
+      { method: 'POST', path: '/auth/github', handler: async () => {
+        await ensureSiteSettings();
+        let data = {};
+        try {
+          data = await request.json();
+        } catch (_) {
+        }
+        const mode = data?.mode === 'bind' ? 'bind' : 'login';
+        if (mode === 'bind') {
+          if (!await checkAuth(request, env, sys)) {
+            return simpleAuthResponse();
+          }
+        } else if (sys.turnstile_enabled === 'true' || sys.turnstile_login_enabled === 'true') {
+          const turnstileToken = request.headers.get('X-Turnstile-Token');
+          if (!await verifyTurnstileToken(turnstileToken, sys.turnstile_secret_key || '')) {
+            return createErrorResponse(new AppError('verificationFailed', 403));
+          }
+        }
+        return handleGithubOAuthStartApi(request, sys, mode);
+      }},
+      { method: 'GET', path: '/auth/github/callback', handler: async () => {
+        await ensureSiteSettings();
+        return handleGithubOAuthCallback(request, env, sys);
       }},
       { method: 'GET', path: '/theme', handler: async () => {
         const themeResult = await handleTheme()

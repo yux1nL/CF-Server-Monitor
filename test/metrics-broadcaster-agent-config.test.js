@@ -57,8 +57,10 @@ function makeSettingsDb(settingsSource) {
   };
 }
 
-function makeDescriptor(md5 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', schemaVersion = 6) {
-  const serialized = schemaVersion >= 6
+function makeDescriptor(md5 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', schemaVersion = 7) {
+  const serialized = schemaVersion >= 7
+    ? `collect_interval=2&report_interval=60&reset_day=1&schema_version=${schemaVersion}&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=&node_1=&node_2=&node_3=&node_4=&connection_mode=auto&wss_report_interval=2&ping_mode=tcp`
+    : schemaVersion >= 6
     ? `collect_interval=2&report_interval=60&reset_day=1&schema_version=${schemaVersion}&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=&connection_mode=auto&wss_report_interval=2&ping_mode=tcp`
     : schemaVersion >= 5
     ? `collect_interval=2&report_interval=60&reset_day=1&schema_version=${schemaVersion}&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=&connection_mode=auto&wss_report_interval=2`
@@ -84,6 +86,12 @@ function makeDescriptor(md5 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', schemaVersion 
   }
   if (schemaVersion >= 6) {
     config.ping_mode = 'tcp';
+  }
+  if (schemaVersion >= 7) {
+    config.node_1 = '';
+    config.node_2 = '';
+    config.node_3 = '';
+    config.node_4 = '';
   }
   return {
     serialized,
@@ -499,7 +507,7 @@ test('WSS agent config push uses string body and structured payload', () => {
         kind: 'agent-report',
         authenticated: true,
         serverId: 'server-1',
-        configSchema: '6',
+        configSchema: '7',
         configMd5: 'none'
       };
     },
@@ -540,7 +548,7 @@ test('WSS agent config push keeps legacy schema without connection mode', () => 
   };
   const broadcaster = makeBroadcaster([ws]);
   const descriptors = new Map([
-    [6, makeDescriptor('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 6)],
+    [7, makeDescriptor('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 7)],
     [5, makeDescriptor('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 5)],
     [4, makeDescriptor('dddddddddddddddddddddddddddddddd', 4)],
     [3, makeDescriptor('cccccccccccccccccccccccccccccccc', 3)]
@@ -708,6 +716,66 @@ test('batch push latestReportOnly keeps latest report updates without subscriber
   assert.equal(latest.updates[0].samples.length, 2);
   assert.deepEqual(latest.updates[0].samples.map(sample => sample.data.cpu), [10, 20]);
   assert.equal(Number.isFinite(latest.updates[0].reportAgeMs), true);
+});
+
+test('Agent WSS batches all-scope subscribers while single-server subscribers stay realtime', async () => {
+  const allMessages = [];
+  const singleMessages = [];
+  const makeFrontendSocket = (attachment, messages) => ({
+    deserializeAttachment() {
+      return attachment;
+    },
+    send(message) {
+      messages.push(JSON.parse(message));
+    }
+  });
+  const broadcaster = makeBroadcaster([
+    makeFrontendSocket({ scope: 'all', serverIds: ['server-1', 'server-2'] }, allMessages),
+    makeFrontendSocket({ scope: 'server-1', serverIds: [] }, singleMessages)
+  ]);
+
+  await broadcaster._ingestRealtimeUpdates([{
+    serverId: 'server-1',
+    samples: [{ ts: 2_000, data: { cpu: 20 } }]
+  }], 10_000, { batchFrontend: true });
+  await broadcaster._ingestRealtimeUpdates([{
+    serverId: 'server-1',
+    samples: [{ ts: 1_000, data: { cpu: 10 } }]
+  }, {
+    serverId: 'server-2',
+    samples: [{ ts: 3_000, data: { cpu: 30 } }]
+  }], 20_000, { batchFrontend: true });
+
+  assert.equal(allMessages.length, 0);
+  assert.equal(singleMessages.length, 2);
+  assert.deepEqual(singleMessages.map(message => message.updates[0].samples[0].data.cpu), [20, 10]);
+  assert.equal(singleMessages.every(message => message.updates.length === 1), true);
+  assert.notEqual(broadcaster.frontendBroadcastTimer, null);
+
+  broadcaster._flushFrontendBroadcastBatch();
+
+  assert.equal(allMessages.length, 1);
+  assert.equal(allMessages[0].type, 'batchUpdate');
+  assert.equal(allMessages[0].ts, 20_000);
+  assert.deepEqual(allMessages[0].updates.map(update => update.serverId), ['server-1', 'server-2']);
+  assert.deepEqual(allMessages[0].updates[0].samples.map(sample => sample.ts), [1_000, 2_000]);
+  assert.deepEqual(allMessages[0].updates[0].samples.map(sample => sample.data.cpu), [10, 20]);
+
+  assert.equal(singleMessages.length, 2);
+  assert.equal(broadcaster.pendingFrontendBroadcasts.size, 0);
+  assert.equal(broadcaster.frontendBroadcastTimer, null);
+});
+
+test('Agent WSS frontend batch queue stays idle without frontend subscribers', () => {
+  const broadcaster = makeBroadcaster([]);
+
+  broadcaster._queueFrontendBroadcastBatch([{
+    serverId: 'server-1',
+    samples: [{ ts: 1_000, data: { cpu: 10 } }]
+  }], 10_000);
+
+  assert.equal(broadcaster.pendingFrontendBroadcasts.size, 0);
+  assert.equal(broadcaster.frontendBroadcastTimer, null);
 });
 
 test('resource alert rule batches are capped at 20 rules', () => {

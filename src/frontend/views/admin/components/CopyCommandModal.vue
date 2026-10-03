@@ -10,8 +10,38 @@
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.targetOs }}</label>
           <select :value="targetOs" class="form-select" @change="$emit('update:target-os', $event.target.value)">
-            <option value="linux">Linux/OpenWrt/Synology DSM/FreeBSD/macOS</option>
+            <option value="linux">Linux (systemd)</option>
+            <option value="unix">OpenWrt/Alpine/Synology DSM/FreeBSD</option>
+            <option value="mac">macOS</option>
             <option value="windows">Windows</option>
+            <option value="docker">Docker</option>
+          </select>
+        </div>
+
+        <div class="form-group flex-1">
+          <label class="form-label">
+            Agent {{ trans.version }}
+            <HelpTooltip :text="targetOs === 'docker' ? trans.dockerVersionTip : trans.installVersionTip" />
+          </label>
+          <input
+            type="text"
+            :value="installVersion"
+            class="form-input"
+            :placeholder="targetOs === 'docker' ? 'latest' : trans.installVersionPlaceholder"
+            @input="$emit('update:install-version', $event.target.value)"
+          >
+        </div>
+      </div>
+
+      <div v-if="targetOs !== 'docker'" class="form-row">
+        <div v-if="targetOs === 'linux'" class="form-group flex-1">
+          <label class="form-label">
+            {{ trans.installMode }}
+            <HelpTooltip :text="trans.nonRootInstallTip" />
+          </label>
+          <select :value="installMode" class="form-select" @change="$emit('update:install-mode', $event.target.value)">
+            <option value="current-user">{{ trans.installModeCurrentUser }}</option>
+            <option value="cfsm-user">{{ trans.installModeCfsmUser }}</option>
           </select>
         </div>
 
@@ -69,22 +99,6 @@
           </span>
         </div>
         <div class="config-row">
-          <span class="config-label">{{ trans.customCt }}</span>
-          <span class="config-value">{{ isBlank(customCt) ? '-' : customCt }}</span>
-        </div>
-        <div class="config-row">
-          <span class="config-label">{{ trans.customCu }}</span>
-          <span class="config-value">{{ isBlank(customCu) ? '-' : customCu }}</span>
-        </div>
-        <div class="config-row">
-          <span class="config-label">{{ trans.customCm }}</span>
-          <span class="config-value">{{ isBlank(customCm) ? '-' : customCm }}</span>
-        </div>
-        <div class="config-row">
-          <span class="config-label">{{ trans.customBd }}</span>
-          <span class="config-value">{{ isBlank(customBd) ? '-' : customBd }}</span>
-        </div>
-        <div class="config-row">
           <span class="config-label">{{ trans.networkInterface }}</span>
           <span class="config-value">{{ isBlank(networkInterface) ? '-' : networkInterface }}</span>
         </div>
@@ -95,6 +109,25 @@
         <div class="config-row">
           <span class="config-label">{{ trans.txCorrection }} (GB)</span>
           <span class="config-value">{{ formatWithUnit(txCorrection, 'GB') }}</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">{{ settings.custom_ct_name || trans.customCt }}</span>
+          <span class="config-value">{{ isBlank(customCt) ? '-' : customCt }}</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">{{ settings.custom_cu_name || trans.customCu }}</span>
+          <span class="config-value">{{ isBlank(customCu) ? '-' : customCu }}</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">{{ settings.custom_cm_name || trans.customCm }}</span>
+          <span class="config-value">{{ isBlank(customCm) ? '-' : customCm }}</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">{{ settings.custom_bd_name || trans.customBd }}</span>
+          <span class="config-value">{{ isBlank(customBd) ? '-' : customBd }}</span>
+        </div>
+        <div v-for="(node, index) in [node1, node2, node3, node4]" :key="index" class="config-row">
+          <span class="config-label">{{ settings[`node_${index + 1}_name`] || `Node ${index + 1}` }}</span><span class="config-value">{{ isBlank(node) ? '-' : node }}</span>
         </div>
       </div>
 
@@ -122,10 +155,13 @@ import HelpTooltip from '../../../components/HelpTooltip.vue'
 
 const props = defineProps({
   trans: { type: Object, required: true },
+  settings: { type: Object, default: () => ({}) },
   show: { type: Boolean, default: false },
   currentServerName: { type: String, default: '' },
   targetOs: { type: String, default: 'linux' },
+  installMode: { type: String, default: 'current-user' },
   installGhProxy: { type: String, default: '' },
+  installVersion: { type: String, default: '' },
   collectInterval: { type: [Number, String], default: 0 },
   reportInterval: { type: [Number, String], default: 60 },
   wssReportInterval: { type: [Number, String], default: 2 },
@@ -135,6 +171,7 @@ const props = defineProps({
   customCu: { type: String, default: '' },
   customCm: { type: String, default: '' },
   customBd: { type: String, default: '' },
+  node1: { type: String, default: '' }, node2: { type: String, default: '' }, node3: { type: String, default: '' }, node4: { type: String, default: '' },
   networkInterface: { type: String, default: '' },
   resetDay: { type: [Number, String], default: 1 },
   rxCorrection: { type: [Number, String], default: '' },
@@ -149,7 +186,9 @@ const emit = defineEmits([
   'copy-cmd',
   'open-edit-from-copy',
   'update:target-os',
-  'update:install-gh-proxy'
+  'update:install-mode',
+  'update:install-gh-proxy',
+  'update:install-version'
 ])
 
 const CUSTOM_GH_PROXY_VALUE = '__custom__'
@@ -186,7 +225,11 @@ const selectedGhProxy = computed({
 })
 
 const showCustomGhProxy = computed(() => selectedGhProxy.value === CUSTOM_GH_PROXY_VALUE)
-const effectivePingMode = computed(() => props.pingMode === 'icmp' ? 'icmp' : 'tcp')
+const effectivePingMode = computed(() => (
+  props.targetOs === 'linux' && props.installMode === 'cfsm-user'
+    ? 'tcp'
+    : (props.pingMode === 'icmp' ? 'icmp' : 'tcp')
+))
 
 watch(
   () => props.show,
